@@ -1,0 +1,250 @@
+---
+title: "coding_exercise_TCGA_infiltration"
+author: "Benedek Danko"
+date: "2024-02-02"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+knitr::opts_knit$set(root.dir = "/home/benedek_danko/R/coding_exercise_TCGA_infiltration")
+```
+
+```{r message=F, warning=F}
+library("tidyverse")
+library("ComplexHeatmap")
+library("viridis")
+```
+
+# Coding exercise using TCGA immune infiltration data
+
+Instructions are from [coding_exercise_TCGA_infiltration](https://github.com/immunitastx/coding_exercise_TCGA_infiltration).
+
+First load the immune infiltration data:
+
+```{r message=F, warning=F}
+# CIBERSORT relative immune cell fractions:
+tcga_immunfrac_cibersort <- read.table("data/TCGA.Kallisto.fullIDs.cibersort.relative.tsv",
+                                       sep="\t", stringsAsFactors = F, header = T) %>% 
+  mutate(SampleID=str_replace_all(SampleID, "\\.", "-"),
+         SampleID=str_extract(SampleID, "TCGA-[\\d\\w]{2}-[\\d\\w]{4}-[\\w\\d]{2}"))
+# Estimated absolute leukocyte fractions:
+tcga_all_leuk <- read.table("data/TCGA_all_leuk_estimate.masked.20170107.tsv",
+                                       sep="\t", stringsAsFactors = F, header = F) %>% 
+  dplyr::rename("CancerType"="V1", "SampleID"="V2", "Fraction"="V3") %>% 
+  mutate(SampleID=str_extract(SampleID, "TCGA-[\\w\\d]{2}-[\\w\\d]{4}-[\\w\\d]{2}"))
+# Downloaded mutational data for LUAD:
+tcga_luad_mut <- read.table("/home/benedek_danko/R/coding_exercise_TCGA_infiltration/data/TCGA_LUAD_SNV_harmonized.txt", 
+                            header = T, sep="\t", stringsAsFactors = F, 
+                            quote="", fill=FALSE) %>% 
+  mutate(SampleID=str_extract(Tumor_Sample_Barcode, "TCGA-[\\w\\d]{2}-[\\w\\d]{4}-[\\w\\d]{2}"))
+```
+
+Check data:
+
+```{r message=F, warning=F}
+dim(tcga_immunfrac_cibersort)
+dim(tcga_all_leuk)
+
+str(tcga_immunfrac_cibersort)
+str(tcga_all_leuk)
+```
+
+## Demonstrate that `TCGA.Kallisto.fullIDs.cibersort.relative.tsv` is relative immune cell abundance
+
+```{r message=F, warning=F}
+tcga_cibersort_rowsums <- rowSums(tcga_immunfrac_cibersort[, 3:24])
+summary(tcga_cibersort_rowsums)
+```
+
+All cell tpye fractions sum up to 1 per sample, meaning that they are relative fractions (CIBERSORT).
+
+## Calculate the absolute immune infiltration by using the `Leukocyte Fraction` using `TCGA_all_leuk_estimate.masked.20170107.tsv`
+
+```{r message=F, warning=F}
+# Calculate samples with more than 1 replicate:
+tcga_replicate_samples <- tcga_immunfrac_cibersort %>% 
+  group_by(SampleID) %>% 
+  summarize(count=n()) %>% 
+  filter(count > 1) %>% 
+  arrange(desc(count)) 
+nrow(tcga_replicate_samples)
+```
+
+There are 93 samples with replicates. Let's calculate mean fractions per sample for each cell type:
+
+```{r message=F, warning=F}
+tcga_immunfrac_cibersort_clean <- tcga_immunfrac_cibersort %>%
+  group_by(SampleID) %>%
+  summarise(across(
+    starts_with("B.cells.naive"):ends_with("Neutrophils"),
+    mean
+  ))
+
+tcga_all_leuk_clean <- tcga_all_leuk %>%
+  dplyr::group_by(SampleID) %>%
+  summarize(Fraction=mean(Fraction))
+```
+
+Calculate absolute fractions:
+
+```{r message=F, warning=F}
+# Intersect of the samples from the two tables:
+intersect_samples <- intersect(tcga_immunfrac_cibersort_clean$SampleID,
+                               tcga_all_leuk_clean$SampleID)
+# Calculate absolute fractions:
+tcga_abs_leuk_fractions <- tcga_immunfrac_cibersort_clean %>% 
+  left_join(tcga_all_leuk_clean %>% 
+              dplyr::select(c(SampleID, Fraction)), 
+            by="SampleID") %>% 
+  filter(SampleID %in% intersect_samples) %>% 
+  filter(!is.na(Fraction)) %>% 
+  mutate(Fraction=ifelse(Fraction < 0, 0, Fraction)) %>% 
+  mutate(across(-c(SampleID, Fraction), ~ . * Fraction))
+summary(rowSums(tcga_abs_leuk_fractions[,2:23]))
+```
+
+I set absolute fraction for values below 0 to 0. I also removed samples without absolute leukocyte measurements.
+
+## Group similar immune cell types together and calculate the absolute immune infiltration for B_cells, T_cells, NK_cells, Monocytes, Macrophages, DCs, Mast, Eosinophils and Neutrophils
+
+```{r message=F, warning=F}
+tcga_abs_leuk_fractions_grouped <- tcga_abs_leuk_fractions %>% 
+  dplyr::select(-Fraction) %>% 
+  column_to_rownames("SampleID") %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("CellType") %>% 
+  mutate(CellType=case_when(str_detect(CellType, "B.cells") ~ "B_cells",
+                            str_detect(CellType, "T.cells") ~ "T_cells",
+                            str_detect(CellType, "NK.cells") ~ "NK_cells",
+                            str_detect(CellType, "Monocytes") ~ "Monocytes",
+                            str_detect(CellType, "Macrophages") ~ "Macrophages",
+                            str_detect(CellType, "Dendritic.cells") ~ "DCs",
+                            str_detect(CellType, "Mast.cells") ~ "Mast_cells",
+                            CellType %in% c("Eosinophils", "Neutrophils") ~ "Eosinophils_Neutrophils",
+                            TRUE ~ CellType)) %>% 
+  group_by(CellType) %>% 
+  summarise(across(.cols = everything(), .fns = sum))
+```
+
+## Plot the immune infiltration of T cells across all cancer types in a boxplot and order the box by the median level of T cell infiltration from high to low
+
+```{r message=F, warning=F, fig.width=12}
+# Format data for T-cells only, add cancer type info:
+tcga_t_cells_per_cancertype <- tcga_abs_leuk_fractions_grouped %>% 
+  as.data.frame() %>% 
+  column_to_rownames("CellType") %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  dplyr::select("T_cells") %>% 
+  rownames_to_column("SampleID") %>% 
+  left_join(tcga_immunfrac_cibersort %>% 
+              dplyr::select(c(SampleID, CancerType))) %>% 
+  group_by(CancerType) %>% 
+  mutate(mean_T=mean(T_cells)) %>% 
+  arrange(desc(mean_T)) 
+tcga_t_cells_per_cancertype$CancerType <- factor(tcga_t_cells_per_cancertype$CancerType,
+                                                 levels=unique(tcga_t_cells_per_cancertype$CancerType))
+
+# Plot data:
+ggplot(tcga_t_cells_per_cancertype,
+       aes(x=CancerType, y=T_cells))+
+  theme_bw()+
+  geom_jitter(width = 0.25, alpha=.4)+
+  geom_boxplot(outlier.shape = NA, width=.3, alpha=1)+
+  xlab("Cancer type")+
+  ylab("T-cells absolute fraction")
+```
+
+## Get the median level of immune infiltration of B_cells, T_cells, NK_cells, Monocytes, Macrophages, DCs, Mast and Eosinophils per cancer type and plot them in a heatmap
+
+```{r message=F, warning=F, fig.height=8}
+# Format data, calculate mean fractions per cancer type:
+tcga_main_cells_per_cancertype <- tcga_abs_leuk_fractions_grouped %>% 
+  as.data.frame() %>% 
+  column_to_rownames("CellType") %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("SampleID") %>% 
+  left_join(tcga_immunfrac_cibersort %>% 
+              dplyr::select(c(SampleID, CancerType))) %>% 
+  dplyr::select(-SampleID) %>% 
+  group_by(CancerType) %>% 
+  summarise(across(.cols = everything(), .fns = mean)) %>% 
+  as.data.frame() %>% 
+  column_to_rownames("CancerType") 
+
+# Plot:
+colnames(tcga_main_cells_per_cancertype) <- c("B-cells", "DCs", "Eosinophils/Neutrophils",
+                                              "Macrophages", "Mast-cells", "Monocytes",
+                                              "NK-cells", "Plasma-cells", "T-cells")
+Heatmap(tcga_main_cells_per_cancertype,
+                         cluster_rows = T,
+                         cluster_columns = T,
+                         col = rev(viridis(n=100, option="magma")),
+                         show_column_names = T,
+                         name="Mean absolute fraction",
+                         border = TRUE,
+                         show_row_names = T,
+                         show_row_dend = T,
+                         row_names_side = "left",
+                         width=unit(100, "mm"))
+```
+
+## Plot the absolute infiltration level for B_cells, T_cells, NK_cells, Monocytes, Macrophages, DCs across different EGFR mutants for LUAD
+
+Based on the LUAD masked mutational data downloaded using `TCGAbiolinks` and matched to our cell type abundance data, there are 28 Exon19 del., 17 Exon20 ins., 20 pL858R mut, 59 Other missense mut., and 472 WT cases. 
+
+```{r message=F, warning=F, fig.width=12, fig.height=10}
+# Get absolute fractions of main cell types for LUAD:
+tcga_main_cells_luad <- tcga_abs_leuk_fractions_grouped %>% 
+  as.data.frame() %>% 
+  column_to_rownames("CellType") %>% 
+  t() %>% 
+  as.data.frame() %>% 
+  rownames_to_column("SampleID") %>% 
+  left_join(tcga_immunfrac_cibersort %>% 
+              dplyr::select(c(SampleID, CancerType))) %>% 
+  filter(CancerType=="LUAD") %>% 
+  dplyr::select(-CancerType) 
+
+# Get EGFR mutational data, create groups:
+tcga_luad_egfr_mut <- tcga_luad_mut %>% 
+  filter(Hugo_Symbol=="EGFR") %>% 
+  mutate(group=case_when(Variant_Type=="INS" & Exon_Number=="20/28" ~ "exon20_ins",
+                         Variant_Type=="DEL" & Exon_Number=="19/28" ~ "exon19_del",
+                         HGVSp_Short == "p.L858R" ~"pL858R_mut",
+                         TRUE ~ NA),
+         group=ifelse(is.na(group) & Variant_Classification=="Missense_Mutation",
+                      "other_missense_mut",
+                      group)) %>% 
+  dplyr::select(c(SampleID, group))
+
+# Merge the two data frames (we assume that samples without EGFR mutational data are WT):
+tcga_main_cells_luad_groups <- tcga_main_cells_luad %>% 
+  left_join(tcga_luad_egfr_mut, by="SampleID") %>% 
+  mutate(group=ifelse(is.na(group), "WT", group)) %>% 
+  pivot_longer(-c(SampleID, group), names_to="CellType", values_to="Abs_abundance") %>% 
+  mutate(CellType=factor(CellType, levels=c("T_cells", "B_cells", "Plasma.cells","NK_cells",
+                                            "Macrophages", "Monocytes","DCs", "Eosinophils_Neutrophils",
+                                            "Mast_cells"),
+                         labels=c("T cells", "B cells", "Plasma cells", "NK cells",
+                                  "Macrophages", "Monocytes", "DCs", "Eosinophils/Neutrophils",
+                                  "Mast cells")),
+         group=factor(group, levels=c("WT", "exon20_ins", "exon19_del",
+                                      "pL858R_mut", "other_missense_mut"),
+                      labels=c("WT", "Exon20 mut.", "Exon19 del.",
+                               "pL858R mut.", "Other missense mut.")))
+
+# Plot data:
+ggplot(tcga_main_cells_luad_groups,
+       aes(x=group, y=Abs_abundance))+
+  theme_bw()+
+  theme(axis.text.x = element_text(angle=60, hjust = 1))+
+  geom_jitter(width = 0.25, alpha=.4)+
+  geom_boxplot(outlier.shape = NA, width=.3, alpha=1)+
+  facet_wrap(vars(CellType), scales="free")+
+  xlab("EGFR mutational group")+
+  ylab("Absolute abundance")
+```
