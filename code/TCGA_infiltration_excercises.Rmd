@@ -171,7 +171,7 @@ tcga_main_cells_per_cancertype <- tcga_abs_leuk_fractions_grouped %>%
               dplyr::select(c(SampleID, CancerType))) %>% 
   dplyr::select(-SampleID) %>% 
   group_by(CancerType) %>% 
-  summarise(across(.cols = everything(), .fns = mean)) %>% 
+  summarise(across(.cols = everything(), .fns = median)) %>% 
   as.data.frame() %>% 
   column_to_rownames("CancerType") 
 
@@ -184,7 +184,7 @@ Heatmap(tcga_main_cells_per_cancertype,
                          cluster_columns = T,
                          col = rev(viridis(n=100, option="magma")),
                          show_column_names = T,
-                         name="Mean absolute fraction",
+                         name="Median absolute fraction",
                          border = TRUE,
                          show_row_names = T,
                          show_row_dend = T,
